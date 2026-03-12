@@ -1635,6 +1635,67 @@ window.addEventListener('load', () => {
     pdfjsLib.GlobalWorkerOptions.workerSrc =
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
+
+  // ── Auto-load from ?autoload=URL query param ──
+  const params = new URLSearchParams(window.location.search);
+  const autoUrl = params.get('autoload');
+  const autoTitle = params.get('title') || 'Book';
+
+  if (autoUrl) {
+    (async () => {
+      showReader();
+      document.getElementById('book-title-text').textContent = autoTitle;
+      setStatus('visible', 'Fetching "' + autoTitle + '"… (this may take a moment)');
+
+      try {
+        const resp = await fetch(autoUrl);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+        // Stream with progress if Content-Length is available
+        const contentLength = resp.headers.get('Content-Length');
+        let buffer;
+
+        if (contentLength) {
+          const total = parseInt(contentLength, 10);
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            const pct = Math.round((received / total) * 100);
+            setStatus('visible', 'Downloading "' + autoTitle + '"… ' + pct + '%');
+          }
+
+          buffer = new Uint8Array(chunks.reduce((acc, c) => acc + c.length, 0));
+          let offset = 0;
+          for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.length; }
+          buffer = buffer.buffer;
+        } else {
+          buffer = await resp.arrayBuffer();
+        }
+
+        // Wrap as a File so handleFile can process it
+        const blob = new Blob([buffer], { type: 'application/pdf' });
+        const file = new File([blob], autoTitle + '.pdf', { type: 'application/pdf' });
+        currentFile = { name: file.name, size: file.size };
+        state = 'loading';
+        words = [];
+        pageBoundaries = [];
+        currentIdx = 0;
+        await loadPDF(file);
+
+      } catch(err) {
+        setStatus('hidden');
+        showToast('⚠️ Could not fetch the book: ' + err.message, 6000);
+        closeBook();
+        console.error(err);
+      }
+    })();
+  }
 });
 </script>
 </body>
