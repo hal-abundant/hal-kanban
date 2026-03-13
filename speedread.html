@@ -1192,10 +1192,91 @@ async function handleFile(file) {
   }
 }
 
+// ── PDF text helpers (global so OCR path can also use them) ────────────────
+
+async function extractPageTextPositional(page) {
+  // Strip headers/footers using Y-coordinate position data from PDF.js
+  const viewport = page.getViewport({ scale: 1 });
+  const ph = viewport.height;
+  // PDF coords: origin bottom-left, y increases upward
+  // Header zone = top 7%  (y > 93% of height)
+  // Footer zone = bottom 6% (y < 6% of height)
+  const headerY = ph * 0.93;
+  const footerY = ph * 0.06;
+
+  const content = await page.getTextContent();
+  const main = [];
+  for (const item of content.items) {
+    const str = item.str;
+    if (!str || !str.trim()) continue;
+    const y = item.transform[5];
+    if (y > headerY || y < footerY) continue; // skip header/footer zones
+    main.push(str);
+  }
+  return main.join(' ');
+}
+
+function cleanPageText(raw) {
+  let t = raw;
+
+  // Parenthetical citations: (Smith, 2003) (IPCC 2014) (Smith et al. 2003, p.45)
+  t = t.replace(/\([^()]{0,120}(?:19|20)\d{2}[a-z]?[^()]{0,60}\)/g, '');
+  // Classic qualifiers
+  t = t.replace(/\(\s*ibid\.?\s*\)/gi, '');
+  t = t.replace(/\(\s*op\.?\s*cit\.?\s*\)/gi, '');
+  t = t.replace(/\(\s*see\s+[^)]{0,80}\)/gi, '');
+  t = t.replace(/\(\s*cf\.?\s+[^)]{0,80}\)/gi, '');
+  t = t.replace(/\(\s*e\.g\.[^)]{0,100}\)/gi, '');
+  t = t.replace(/\(\s*i\.e\.[^)]{0,80}\)/gi, '');
+  t = t.replace(/\(\s*pp?\.\s*\d+[\u2013\-]?\d*\)/g, '');
+
+  // Bracketed numeric citations: [1] [23] [1-4] [1,2,3]
+  t = t.replace(/\[\s*\d[\d,\s\u2013\-]{0,15}\]/g, '');
+
+  // Superscript unicode footnote markers
+  t = t.replace(/[\u00B9\u00B2\u00B3\u2074-\u2079\u2070]+/g, '');
+
+  // Isolated 1-2 digit footnote ref numbers: "word4 Next" -> "word Next"
+  t = t.replace(/([a-z,;])\s*(\d{1,2})\s+(?=[A-Z])/g, '$1 ');
+
+  // Figure/table caption stubs bleeding into body text
+  t = t.replace(/\bFig(?:ure)?[.:]?\s*\d+[.\d]*[^.]{0,150}\./g, '');
+  t = t.replace(/\bTable\s+\d+[.\d]*[^.]{0,120}\./g, '');
+
+  // Standalone page numbers (isolated 1-4 digit numbers)
+  t = t.replace(/(^|\s)\d{1,4}(\s|$)/g, ' ');
+
+  // DOI and URL artifacts
+  t = t.replace(/https?:\/\/\S+/g, '');
+  t = t.replace(/doi:\S+/gi, '');
+  t = t.replace(/www\.\S+/g, '');
+
+  // Multiple spaces -> single space
+  t = t.replace(/\s{2,}/g, ' ').trim();
+
+  return t;
+}
+
+function buildRepeatFilter(pageTexts) {
+  // Find phrases appearing on >15% of pages → likely running headers/footers
+  const freq = {};
+  for (const pt of pageTexts) {
+    const candidates = [pt.slice(0, 80).trim(), pt.slice(-80).trim()];
+    for (const c of candidates) {
+      const frag = c.slice(0, 60).trim();
+      if (frag.length >= 3 && frag.length <= 60 && frag.split(' ').length <= 6) {
+        freq[frag] = (freq[frag] || 0) + 1;
+      }
+    }
+  }
+  const threshold = Math.max(3, pageTexts.length * 0.15);
+  return new Set(Object.entries(freq).filter(([, v]) => v >= threshold).map(([k]) => k));
+}
+
 async function loadPDF(file) {
   if (typeof pdfjsLib === 'undefined') {
     setStatus('hidden');
-    showToast('⚠️ PDF.js not loaded. Check your internet connection or paste text manually.', 6000);
+    showToast('\u26a0\ufe0f PDF.js not loaded. Check your internet connection or paste text manually.', 6000);
     return;
   }
 
@@ -1205,27 +1286,23 @@ async function loadPDF(file) {
     pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   } catch(err) {
     setStatus('hidden');
-    showToast('⚠️ Could not parse PDF. Try pasting the text instead.', 5000);
+    showToast('\u26a0\ufe0f Could not parse PDF. Try pasting the text instead.', 5000);
     return;
   }
 
   const numPages = pdf.numPages;
-  let allText = '';
-  const boundaries = [];
-  let wordCount = 0;
   let totalChars = 0;
   const samplePages = Math.min(5, numPages);
 
-  // First pass: extract text + measure
+  // Pass 1: positional extraction (strips header/footer zones by Y coordinate)
   const pageTexts = [];
   for (let p = 1; p <= numPages; p++) {
-    setStatus('visible', `Extracting text… page ${p} of ${numPages}`);
+    setStatus('visible', `Extracting text\u2026 page ${p} of ${numPages}`);
     try {
       const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      const pageText = content.items.map(i => i.str).join(' ').trim();
-      pageTexts.push(pageText);
-      if (p <= samplePages) totalChars += pageText.length;
+      const raw = await extractPageTextPositional(page);
+      pageTexts.push(raw);
+      if (p <= samplePages) totalChars += raw.length;
     } catch(e) {
       pageTexts.push('');
     }
@@ -1234,15 +1311,20 @@ async function loadPDF(file) {
   const avgChars = totalChars / samplePages;
 
   if (avgChars < 30) {
-    // Scanned PDF → OCR
-    setStatus('visible', 'This appears to be a scanned PDF. Processing with OCR — this may take a few minutes. You can start reading page 1 now.');
+    // Scanned PDF \u2192 OCR path
+    setStatus('visible', 'This appears to be a scanned PDF. Processing with OCR \u2014 you can start reading page 1 now.');
     await runOCR(pdf, numPages, file);
   } else {
-    // Normal text PDF
+    // Pass 2: build repeat-phrase filter then clean each page
+    const repeatPhrases = buildRepeatFilter(pageTexts);
     const allBoundaries = [];
     const allWords = [];
     for (let p = 0; p < numPages; p++) {
-      const pageWords = pageTexts[p].split(/\s+/).filter(w => w.length > 0);
+      let pageText = cleanPageText(pageTexts[p]);
+      for (const phrase of repeatPhrases) {
+        pageText = pageText.split(phrase).join(' ');
+      }
+      const pageWords = pageText.split(/\s+/).filter(w => w.length > 0);
       allBoundaries.push({ page: p + 1, startIdx: allWords.length });
       allWords.push(...pageWords);
     }
@@ -1250,6 +1332,7 @@ async function loadPDF(file) {
     processText(allWords.join(' '), allBoundaries);
   }
 }
+
 
 async function runOCR(pdf, numPages, file) {
   await loadTesseract();
@@ -1275,7 +1358,8 @@ async function runOCR(pdf, numPages, file) {
       await page.render({ canvasContext: ctx, viewport }).promise;
       const dataUrl = canvas.toDataURL('image/png');
       const result = await worker.recognize(dataUrl);
-      const pageText = result.data.text;
+      // Apply same citation/artifact cleaning to OCR output
+      const pageText = cleanPageText(result.data.text);
       const pageWords = pageText.split(/\s+/).filter(w => w.length > 0);
       if (pageWords.length > 0) {
         if (pageBoundaries.length === 0 || pageBoundaries[pageBoundaries.length-1].page !== p) {
