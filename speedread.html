@@ -1219,44 +1219,56 @@ async function extractPageTextPositional(page) {
 function cleanPageText(raw) {
   let t = raw;
 
-  // Parenthetical citations: (Smith, 2003) (IPCC 2014) (Smith et al. 2003, p.45)
-  t = t.replace(/\([^()]{0,120}(?:19|20)\d{2}[a-z]?[^()]{0,60}\)/g, '');
-  // Classic qualifiers
+  // ── ACADEMIC CITATIONS — tight pattern, conservative by design ───────────
+  //
+  // Removes the classic author-year format ONLY:
+  //   (Smith 2003)  (Smith, 2003)  (Smith and Jones 2003, p.45)
+  //   (Smith et al. 2014; Jones 2016)  (see Smith 2003)
+  //
+  // Will NOT touch:
+  //   "(Bitcoin became legal tender in 2021)"  → contains a verb, not stripped
+  //   "(the 2021 bull run was historic)"        → starts with article, not stripped
+  //   "(increased 30% since 2019)"              → starts lowercase, not stripped
+  //   "(see Figure 3.2)"                        → no year after Figure, not stripped
+  //   "(e.g., ...)  (i.e., ...)"                → preserved — may be content
+  //
+  // Surname rule: requires Capital + 2+ lowercase letters.
+  // Trade-off: org abbreviations like (IPCC 2014) are left in — intentional.
+  // Better to keep ambiguous parens than risk stripping real content.
+
+  const S   = '[A-Z][a-z][a-z\u00C0-\u017E\\-]+';                          // one surname ≥3 chars
+  const A   = S + '(?:\\s+(?:and|&)\\s+' + S + '|\\s+et\\s+al\\.?)?';     // author(s)
+  const Y   = '(?:19|20)\\d{2}[a-z]?';                                      // 4-digit year
+  const P   = '(?:[,:]\\s*pp?\\.?\\s*\\d+[\u2013\\-]?\\d*)?';              // optional page ref
+  const ONE = A + '(?:,\\s*|\\s+)' + Y + P;                                 // one author-year pair
+  const ALL = '(?:(?:see|cf\\.)\\s+)?' + ONE + '(?:\\s*;\\s*' + ONE + ')*'; // full citation
+  t = t.replace(new RegExp('\\(' + ALL + '\\)', 'g'), '');
+
+  // ── UNAMBIGUOUS LATIN CITATION SHORTHAND ─────────────────────────────────
   t = t.replace(/\(\s*ibid\.?\s*\)/gi, '');
   t = t.replace(/\(\s*op\.?\s*cit\.?\s*\)/gi, '');
-  t = t.replace(/\(\s*see\s+[^)]{0,80}\)/gi, '');
-  t = t.replace(/\(\s*cf\.?\s+[^)]{0,80}\)/gi, '');
-  t = t.replace(/\(\s*e\.g\.[^)]{0,100}\)/gi, '');
-  t = t.replace(/\(\s*i\.e\.[^)]{0,80}\)/gi, '');
-  t = t.replace(/\(\s*pp?\.\s*\d+[\u2013\-]?\d*\)/g, '');
 
-  // Bracketed numeric citations: [1] [23] [1-4] [1,2,3]
-  t = t.replace(/\[\s*\d[\d,\s\u2013\-]{0,15}\]/g, '');
+  // ── BRACKETED NUMERIC CITATIONS: [1]  [23]  [1–4]  [1,2,3] ──────────────
+  t = t.replace(/\[\s*\d[\d,\s\u2013\-]{0,12}\]/g, '');
 
-  // Superscript unicode footnote markers
+  // ── SUPERSCRIPT UNICODE FOOTNOTE MARKERS: ¹²³⁴ ──────────────────────────
   t = t.replace(/[\u00B9\u00B2\u00B3\u2074-\u2079\u2070]+/g, '');
 
-  // Isolated 1-2 digit footnote ref numbers: "word4 Next" -> "word Next"
-  t = t.replace(/([a-z,;])\s*(\d{1,2})\s+(?=[A-Z])/g, '$1 ');
+  // ── GLUED INLINE FOOTNOTE NUMBERS ────────────────────────────────────────
+  // "word4 Next sentence" → "word Next sentence"
+  // Only fires when the digit is glued directly to a word char (no space)
+  // AND is followed by a capital-starting word — the classic inline footnote.
+  t = t.replace(/([a-z])(\d{1,2})(?=\s+[A-Z])/g, '$1');
 
-  // Figure/table caption stubs bleeding into body text
-  t = t.replace(/\bFig(?:ure)?[.:]?\s*\d+[.\d]*[^.]{0,150}\./g, '');
-  t = t.replace(/\bTable\s+\d+[.\d]*[^.]{0,120}\./g, '');
-
-  // Standalone page numbers (isolated 1-4 digit numbers)
-  t = t.replace(/(^|\s)\d{1,4}(\s|$)/g, ' ');
-
-  // DOI and URL artifacts
+  // ── URL / DOI ARTIFACTS ──────────────────────────────────────────────────
   t = t.replace(/https?:\/\/\S+/g, '');
-  t = t.replace(/doi:\S+/gi, '');
-  t = t.replace(/www\.\S+/g, '');
+  t = t.replace(/\bdoi:\s*\S+/gi, '');
 
-  // Multiple spaces -> single space
+  // ── NORMALISE WHITESPACE ─────────────────────────────────────────────────
   t = t.replace(/\s{2,}/g, ' ').trim();
 
   return t;
 }
-
 function buildRepeatFilter(pageTexts) {
   // Find phrases appearing on >15% of pages → likely running headers/footers
   const freq = {};
